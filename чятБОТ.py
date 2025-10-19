@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import contextlib
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel, get_cosine_schedule_with_warmup
@@ -10,18 +11,46 @@ from torch.optim import AdamW
 DATA_PATH = "dataset.json"
 VOCAB_PATH = "vocab.pt"
 MODEL_DIR = "my_gpt2_model"
-MAX_LEN = 128
-BATCH_SIZE = 32
-EPOCHS = 8
-LR = 2e-4
-WEIGHT_DECAY = 0.01
-LOG_EVERY = 20
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Warning: {name}={raw!r} is not an int. Using default {default}.")
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"Warning: {name}={raw!r} is not a float. Using default {default}.")
+        return default
+
+
+MAX_LEN = _env_int("MAX_LEN", 128)
+BATCH_SIZE = _env_int("BATCH_SIZE", 32)
+EPOCHS = _env_int("EPOCHS", 8)
+LR = _env_float("LR", 2e-4)
+WEIGHT_DECAY = _env_float("WEIGHT_DECAY", 0.01)
+LOG_EVERY = _env_int("LOG_EVERY", 20)
 
 # ---------- Device ----------
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA is not available. Перевірте драйвери/установку PyTorch.")
-device = torch.device("cuda")
-print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
+    use_amp = True
+else:
+    device = torch.device("cpu")
+    print("Using CPU. CUDA is not available.")
+    use_amp = False
 
 # ---------- Tokenizer ----------
 class WordTokenizer:
@@ -149,7 +178,7 @@ print(f"Vocab size: {tokenizer.vocab_size}")
 
 # ---------- DataLoader ----------
 train_ds = ChatDataset(data, tokenizer, max_length=MAX_LEN)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
 # ---------- Model ----------
 cfg = GPT2Config(
@@ -200,25 +229,45 @@ scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup, 
 
 # ---------- AMP compatibility (robust) ----------
 # We create a small wrapper for autocast that handles API differences across PyTorch versions.
-try:
-    # prefer torch.amp if available
-    GradScaler = torch.amp.GradScaler
-    _amp_autocast = torch.amp.autocast
-    def autocast(*args, **kwargs):
-        try:
-            # try calling without device_type first
+if use_amp:
+    try:
+        # prefer torch.amp if available
+        GradScaler = torch.amp.GradScaler
+        _amp_autocast = torch.amp.autocast
+
+        def autocast(*args, **kwargs):
+            try:
+                # try calling without device_type first
+                return _amp_autocast(*args, **kwargs)
+            except TypeError:
+                # older/newer API requires explicit device_type
+                return _amp_autocast(device_type="cuda")
+
+        scaler = GradScaler()
+    except Exception:
+        # fallback to torch.cuda.amp
+        GradScaler = torch.cuda.amp.GradScaler
+        _amp_autocast = torch.cuda.amp.autocast
+
+        def autocast(*args, **kwargs):
             return _amp_autocast(*args, **kwargs)
-        except TypeError:
-            # older/newer API requires explicit device_type
-            return _amp_autocast(device_type="cuda")
-    scaler = GradScaler()
-except Exception:
-    # fallback to torch.cuda.amp
-    GradScaler = torch.cuda.amp.GradScaler
-    _amp_autocast = torch.cuda.amp.autocast
+
+        scaler = GradScaler()
+else:
+    class DummyScaler:
+        def scale(self, loss):
+            return loss
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
     def autocast(*args, **kwargs):
-        return _amp_autocast(*args, **kwargs)
-    scaler = GradScaler()
+        return contextlib.nullcontext()
+
+    scaler = DummyScaler()
 
 # ---------- Training ----------
 model.train()
@@ -249,8 +298,12 @@ for epoch in range(1, EPOCHS + 1):
 
         running += loss.item()
         global_step += 1
-        if step % LOG_EVERY == 0:
-            print(f"epoch {epoch} step {step}/{len(train_loader)} loss {running/LOG_EVERY:.4f}")
+        if step % LOG_EVERY == 0 or step == len(train_loader):
+            divisor = LOG_EVERY if step % LOG_EVERY == 0 else step % LOG_EVERY
+            divisor = divisor if divisor != 0 else LOG_EVERY
+            print(
+                f"epoch {epoch} step {step}/{len(train_loader)} loss {running/divisor:.4f}"
+            )
             running = 0.0
 
 # ---------- Save ----------
@@ -263,12 +316,17 @@ print("Saved model and vocab.")
 def generate_reply(prompt, max_new_tokens=40, temperature=0.7, top_p=0.9, top_k=50):
     prefix_tokens = [tokenizer.bos_token] + prompt.split() + [tokenizer.sep_token]
     prefix_ids, attn = tokenizer.encode_tokens(prefix_tokens, max_length=MAX_LEN)
-    input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
-    attention_mask = torch.tensor([attn], dtype=torch.long, device=device)
+    prompt_length = int(sum(attn))
+    trimmed_ids = prefix_ids[:prompt_length]
+    trimmed_mask = [1] * prompt_length
+    available_new_tokens = max(1, MAX_LEN - prompt_length)
+    effective_new_tokens = min(max_new_tokens, available_new_tokens)
+    input_ids = torch.tensor([trimmed_ids], dtype=torch.long, device=device)
+    attention_mask = torch.tensor([trimmed_mask], dtype=torch.long, device=device)
     gen_ids = model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=effective_new_tokens,
         do_sample=True,
         temperature=temperature,
         top_p=top_p,
@@ -280,7 +338,7 @@ def generate_reply(prompt, max_new_tokens=40, temperature=0.7, top_p=0.9, top_k=
     try:
         sep_pos = gen_ids.index(sep_id)
     except ValueError:
-        sep_pos = len(prefix_ids) - 1
+        sep_pos = len(trimmed_ids) - 1
     answer_ids = gen_ids[sep_pos + 1 :]
     eos_id = tokenizer.vocab[tokenizer.eos_token]
     if eos_id in answer_ids:
